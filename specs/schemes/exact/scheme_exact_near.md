@@ -24,6 +24,15 @@ NEAR networks MUST use CAIP-style identifiers:
 
 Implementations MAY support additional `near:*` identifiers, but this spec defines behavior for the two canonical networks above.
 
+## Payment Flow
+
+The NEAR `exact` mechanism uses the `default` asset transfer method. It supports two payment flows:
+
+- `authorization` (default): verify → resource → settle, as described in [Protocol Flow](#protocol-flow). A failed resource handler leaves the client uncharged.
+- `upfront`: settle → resource → respond. `/verify` is not called. `/settle` runs the full [Facilitator Verification Rules](#facilitator-verification-rules-must) and returns only after the inner `ft_transfer` has succeeded, then the resource executes. If the handler fails, the client has already been charged, and this scheme defines no refund (see [Exact Scheme Overview](./scheme_exact.md)).
+
+When the resolved flow is `upfront`, `accepts[].extra.paymentFlow` MUST be `"upfront"`. Clients SHOULD prefer `authorization` when a resource offers both.
+
 ## Protocol Flow
 
 1. Client requests a protected resource.

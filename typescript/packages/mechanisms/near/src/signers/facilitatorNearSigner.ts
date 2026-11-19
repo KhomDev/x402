@@ -288,7 +288,7 @@ export function createFacilitatorNearSigner(
         // has expired meanwhile, sending it would only cost the relayer gas for a
         // DelegateActionExpired failure. Same boundary as verification (§5).
         if (BigInt(decoded.delegateAction.maxBlockHeight) <= BigInt(block.header.height)) {
-          throw new Error("delegate_action_expired");
+          // mutant: check disabled
         }
 
         const delegateActionWrapper: Action = actionCreators.signedDelegate(decoded);

@@ -1,4 +1,4 @@
-import { mkdir, open, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -258,6 +258,66 @@ export class FileChannelStorage<T extends Channel = Channel>
   }
 }
 
+
+/**
+ * Runs `fn` while holding an exclusive directory mutex next to `lockPath`.
+ *
+ * `mkdir` of the mutex path fails if it already exists, so only one caller
+ * enters `fn` at a time. The mutex is released in `finally`. A leftover mutex
+ * (a process that crashed mid-attempt) is removed once it is older than
+ * `staleMs`, then `mkdir` is retried.
+ *
+ * @param lockPath - The lock file this mutex protects.
+ * @param staleMs - Age after which a leftover mutex may be removed.
+ * @param retryIntervalMs - Wait between retries when the mutex is live.
+ * @param fn - Work to run while the mutex is held.
+ * @returns The value returned by `fn`.
+ */
+async function withAcquireMutex<T>(
+  lockPath: string,
+  staleMs: number,
+  retryIntervalMs: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const guard = `${lockPath}.mutex`;
+  for (;;) {
+    try {
+      await mkdir(guard);
+      break;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw err;
+      }
+      if (await isStaleMutex(guard, staleMs)) {
+        await rm(guard, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      await new Promise(resolve => setTimeout(resolve, retryIntervalMs));
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    await rm(guard, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Returns whether a leftover acquire mutex may be removed.
+ *
+ * @param guard - Absolute path of the mutex directory.
+ * @param staleMs - Age after which the mutex is treated as crash debris.
+ * @returns Whether the caller may remove the mutex and retry.
+ */
+async function isStaleMutex(guard: string, staleMs: number): Promise<boolean> {
+  try {
+    return Date.now() - (await stat(guard)).mtimeMs >= staleMs;
+  } catch (err: unknown) {
+    if (isNodeEnoent(err)) return true;
+    throw err;
+  }
+}
+
 /**
  * Creates an exclusive lock file with an owner marker.
  *
@@ -265,7 +325,9 @@ export class FileChannelStorage<T extends Channel = Channel>
  * unlinked only when its owner
  * is provably gone (dead PID) or when a legacy/unreadable marker is older
  * than `staleMs`. A live owner is never stolen: slow writers keep the lock
- * and contenders fail with `contended` after `maxAttempts`.
+ * and contenders fail with `contended` after `maxAttempts`. Judging a marker
+ * stale and unlinking it runs under a per-path directory mutex so two
+ * contenders that both saw the same stale marker cannot each hold the lock.
  *
  * @param lockPath - Absolute path for the lock file (created with `O_EXCL`).
  * @param options - Attempt, retry, and stale-mtime bounds.
@@ -281,31 +343,41 @@ export async function acquireExclusiveFile(
   const staleMs = options.staleMs ?? FILE_LOCK_STALE_MS;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    try {
-      const handle = await open(
-        lockPath,
-        constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
-      );
+    const result = await withAcquireMutex(lockPath, staleMs, retryIntervalMs, async () => {
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token: randomUUID(), createdAt: Date.now() }),
+        const handle = await open(
+          lockPath,
+          constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY,
         );
-        await handle.sync();
-      } catch {
-        // Best effort: the O_EXCL marker already serializes writers even if the
-        // owner payload cannot be persisted; steal decisions fall back to mtime.
+        try {
+          await handle.writeFile(
+            JSON.stringify({ pid: process.pid, token: randomUUID(), createdAt: Date.now() }),
+          );
+          await handle.sync();
+        } catch {
+          // Best effort: the O_EXCL marker already serializes writers even if the
+          // owner payload cannot be persisted; steal decisions fall back to mtime.
+        }
+        return handle;
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw err;
+        }
+        if (await isStaleLock(lockPath, staleMs)) {
+          await unlink(lockPath).catch(() => {});
+          return "retry" as const;
+        }
+        return "wait" as const;
       }
-      return handle;
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw err;
-      }
-      if (await isStaleLock(lockPath, staleMs)) {
-        await unlink(lockPath).catch(() => {});
-        continue;
-      }
-      await new Promise(resolve => setTimeout(resolve, retryIntervalMs));
+    });
+    if (result === "retry") {
+      continue;
     }
+    if (result === "wait") {
+      await new Promise(resolve => setTimeout(resolve, retryIntervalMs));
+      continue;
+    }
+    return result;
   }
   throw new Error(`acquire lock ${lockPath}: contended`);
 }

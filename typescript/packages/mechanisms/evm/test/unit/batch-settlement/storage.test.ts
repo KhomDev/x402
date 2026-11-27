@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, mkdir, readdir, readFile, rm, unlink, utimes, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   isNodeEnoent,
   readJsonFile,
@@ -831,6 +833,56 @@ describe("FileChannelStorage", () => {
     const handle = await acquireExclusiveFile(lockPath, { maxAttempts: 5, retryIntervalMs: 1 });
     await handle.close();
     await unlink(lockPath).catch(() => {});
+  });
+
+  it("lets only one caller hold a lock recovered from a dead owner", async () => {
+    const serverDir = join(root, "server");
+    await mkdir(serverDir, { recursive: true });
+    const lockPath = join(serverDir, "race.lock");
+    const dead = JSON.stringify({
+      pid: 2147483647,
+      token: "dead-owner",
+      createdAt: Date.now(),
+    });
+    const worker = join(dirname(fileURLToPath(import.meta.url)), "acquireExclusiveFile-worker.ts");
+
+    const runWorker = () =>
+      new Promise<{ holdStart: number; holdEnd: number }>((resolvePromise, reject) => {
+        const child = spawn(process.execPath, ["--import", "tsx", worker, lockPath], {
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let out = "";
+        let err = "";
+        child.stdout.on("data", chunk => {
+          out += String(chunk);
+        });
+        child.stderr.on("data", chunk => {
+          err += String(chunk);
+        });
+        child.on("error", reject);
+        child.on("close", code => {
+          const hold = /HOLD (\d+)/.exec(out);
+          const release = /RELEASE (\d+)/.exec(out);
+          if (code !== 0 || !hold || !release) {
+            reject(new Error(`worker exited ${code}: ${out} ${err}`));
+            return;
+          }
+          resolvePromise({ holdStart: Number(hold[1]), holdEnd: Number(release[1]) });
+        });
+      });
+
+    for (let round = 0; round < 20; round++) {
+      await writeFile(lockPath, dead);
+      const intervals = await Promise.all(Array.from({ length: 8 }, () => runWorker()));
+      let maxHolders = 0;
+      for (const current of intervals) {
+        const overlap = intervals.filter(
+          other => other.holdStart < current.holdEnd && current.holdStart < other.holdEnd,
+        ).length;
+        if (overlap > maxHolders) maxHolders = overlap;
+      }
+      expect(maxHolders, `round ${round}`).toBeLessThanOrEqual(1);
+    }
   });
 
   it("rejects live lock-file contention after bounded attempts", async () => {
